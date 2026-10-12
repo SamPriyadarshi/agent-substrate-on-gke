@@ -1,0 +1,30 @@
+apiVersion: substrate.google.com/v1alpha1
+kind: WorkerPool
+metadata:
+  name: c3-agent-workers
+  namespace: demo-agents
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        agent-substrate.io/role: worker
+    spec:
+      tolerations:
+      - key: "agent-substrate.io/role"
+        operator: "Equal"
+        value: "worker"
+        effect: "NoSchedule"
+      containers:
+      - name: worker
+        image: us-docker.pkg.dev/gke-substrate-release/substrate/ateom-gvisor:v0.2.0-gke.0
+        resources:
+          requests:
+            cpu: "8"
+            memory: "28Gi"
+          limits:
+            cpu: "12"
+            memory: "32Gi"
+        env:
+        - name: ATEOM_MAX_ACTORS
+          value: "100"
