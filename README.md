@@ -29,8 +29,9 @@ A comprehensive, production-grade guide, architecture reference, and manifest re
 8. [Deploying Your First Agent (Actor)](#deploying-your-first-agent-actor)
 9. [Suspend & Resume Lifecycle](#suspend--resume-lifecycle)
 10. [Scaling & Sizing Formula](#scaling--sizing-formula)
-11. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
-12. [Troubleshooting & Verification](#troubleshooting--verification)
+11. [AI Tool Mesh & MCP Governance (Istio Ambient)](#ai-tool-mesh--mcp-governance-istio-ambient)
+12. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
+13. [Troubleshooting & Verification](#troubleshooting--verification)
 
 ---
 
@@ -185,7 +186,7 @@ Substrate supports two operational topologies for this database:
 - **Single-Zone / Single-Cluster Scope**: Workloads where agent sessions are disposable and catastrophic regional failure does not require automated failover to a secondary site.
 
 ### When to Use Cloud SQL for PostgreSQL (Enterprise Production & DR)
-- **High Availability & BCM SLAs**: Enterprise banking (such as HSBC) mandates strict Business Continuity Management (BCM) and Recovery Time Objectives (RTO < 60s).
+- **High Availability & BCM SLAs**: Regulated enterprise environments (e.g. tier-1 financial institutions) mandates strict Business Continuity Management (BCM) and Recovery Time Objectives (RTO < 60s).
 - **Multi-Region Cluster Topologies**: When running an active-passive or active-active GKE architecture across paired regions (e.g., London `europe-west2` and Belgium `europe-west1`), Cloud SQL provides **Cross-Region Replication**. If Region A goes dark, the secondary GKE cluster in Region B promotes the read replica and hydrates suspended actors directly from the paired GCS Dual-Region bucket without losing actor session registry state.
 - **Zero-Password Security Posture**: Uses GKE Workload Identity and `cloud-sql-proxy` with `CSQL_PROXY_AUTO_IAM_AUTHN=true`, eliminating static credentials from Kubernetes secrets or etcd.
 
@@ -528,6 +529,52 @@ $$\text{Max Actors per Worker} = \min\left( \frac{\text{Worker RAM} - \text{Over
 3. **Pending State**: If existing nodes lack capacity, the new Worker Pods enter `Pending (Unschedulable)`.
 4. **Node Auto-Provisioning (NAP)**: Detects pending pods with `ComputeClass/agent-worker-class` and calls GCE APIs to spin up new `c3-standard-4` VMs.
 5. **Pod Binding**: Once the VM joins the cluster, the Worker Pod starts, and actors resume immediately.
+
+---
+
+## AI Tool Mesh & MCP Governance (Istio Ambient)
+
+When agents scale beyond running isolated sandbox code and begin calling backend enterprise APIs, databases, and microservices via the **Model Context Protocol (MCP)**, platform teams must solve **tool governance, runaway loop protection, and auditability**.
+
+Traditional service mesh sidecars add ~100MB RAM and 0.1 vCPU per container, destroying Agent Substrate's compute density. This repository provides a reference architecture using **Istio Ambient Mesh (ztunnel + Waypoint)** to enforce L7 tool security **without injecting sidecars** into agent worker pods.
+
+```
+Agent Substrate Worker Pod                     Istio Ambient Data Plane                Model Context Protocol (MCP) Tools
++-------------------------------+              +------------------------+              +---------------------------------+
+| Actor (Finance Agent)         |              | L4 ztunnel (DaemonSet) |              | Waypoint Proxy (mcp-tools NS)   |
+| - Principal: sa-agent-finance +-[mTLS HBONE]->                      +-[mTLS HBONE]-> - Enforces RBAC Policy          |
++-------------------------------+  (Port 15008)| - Zero-sidecar tax     |  (Port 15008)| - Token-Bucket Rate Limiter     |
+                                               +------------------------+              | - Google Cloud Trace Exporter   |
+                                                                                       +----------------+----------------+
+                                                                                                        |
+                                                                                       +----------------v----------------+
+                                                                                       | Backend MCP Tool Services       |
+                                                                                       | * currency-tool (ALLOWED: 200)  |
+                                                                                       | * database-tool (ALLOWED: 200)  |
+                                                                                       +---------------------------------+
+```
+
+### The 5 Governance Pillars
+
+1. **Least-Privilege Tool RBAC**: Uses Istio `AuthorizationPolicy` targeting backend services. Only authenticated agent service accounts can invoke sensitive tools (e.g. `sa-agent-finance` can call `currency-tool`, while `sa-agent-support` receives an instant `403 Forbidden`).
+2. **Runaway Agent Rate Limiting**: Injects Envoy token-bucket filters (10 req/s) at the Waypoint to protect downstream APIs from infinite LLM retry loops.
+3. **Distributed Cloud Trace Telemetry**: Attaches W3C `traceparent` headers with `ai.mcp.tool` and `ai.agent.principal` tags, exporting complete spans directly to Google Cloud Trace.
+4. **Sidecarless Zero-Trust mTLS**: Enforces mutual TLS with cryptographic SPIFFE identities using node-level ztunnels and HBONE (HTTP-based Overlay Network) over port 15008.
+5. **Gateway API Protocol Routing**: Standard Kubernetes Gateway API `HTTPRoute` resources managing health checks, timeouts (30s), and path routing for JSON-RPC 2.0 MCP tools.
+
+### Deploying & Testing the AI Mesh
+
+The manifests and automation scripts are located in [`manifests/ai-mesh/`](manifests/ai-mesh/):
+
+```bash
+# 1. Deploy Ambient mesh, Waypoint proxies, and mock MCP tools
+./manifests/ai-mesh/deploy-ai-mesh.sh
+
+# 2. Run the automated test battery verifying all 5 pillars
+./manifests/ai-mesh/verify-ai-mesh.sh
+```
+
+For full details on manifests, CRDs, and configurations, see the [AI Mesh Documentation](manifests/ai-mesh/README.md).
 
 ---
 
