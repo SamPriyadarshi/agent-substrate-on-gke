@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-client-script
+  namespace: ate-workers
+data:
+  client.py: |
+    import urllib.request
+    import json
+    import sys
+    import os
+
+    TOOL = os.environ.get("TARGET_TOOL", "currency-tool")
+    URL = f"http://{TOOL}.mcp-tools.svc.cluster.local:8080/"
+
+    def call_mcp(method, params=None):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or {}
+        }
+        req = urllib.request.Request(
+            URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-mcp-tool": TOOL,
+                "x-agent-session": os.environ.get("HOSTNAME", "agent-session")
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print(f"[STATUS {resp.status}] Response: {resp.read().decode('utf-8')}")
+        except urllib.error.HTTPError as e:
+            print(f"[HTTP ERROR {e.code}] {e.read().decode('utf-8')}")
+        except Exception as e:
+            print(f"[CALL FAILED] {e}")
+
+    if __name__ == "__main__":
+        print(f"Agent invoking {TOOL} at {URL}...")
+        call_mcp("tools/list")
+        if TOOL == "currency-tool":
+            call_mcp("tools/call", {"name": "get_exchange_rate", "arguments": {"from_currency": "USD", "to_currency": "EUR"}})
+        elif TOOL == "database-tool":
+            call_mcp("tools/call", {"name": "query_database", "arguments": {"query": "SELECT * FROM customers;"}})
+        elif TOOL == "search-tool":
+            call_mcp("tools/call", {"name": "web_search", "arguments": {"query": "Agent Substrate on GKE"}})
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-finance
+  namespace: ate-workers
+  labels:
+    app: agent-finance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-finance
+  template:
+    metadata:
+      labels:
+        app: agent-finance
+    spec:
+      serviceAccountName: sa-agent-finance
+      containers:
+      - name: agent
+        image: python:3.11-slim
+        command: ["sleep", "infinity"]
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+      volumes:
+      - name: script
+        configMap:
+          name: agent-client-script
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-support
+  namespace: ate-workers
+  labels:
+    app: agent-support
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-support
+  template:
+    metadata:
+      labels:
+        app: agent-support
+    spec:
+      serviceAccountName: sa-agent-support
+      containers:
+      - name: agent
+        image: python:3.11-slim
+        command: ["sleep", "infinity"]
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+      volumes:
+      - name: script
+        configMap:
+          name: agent-client-script

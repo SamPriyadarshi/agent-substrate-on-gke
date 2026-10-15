@@ -15,17 +15,22 @@ A comprehensive, production-grade guide, architecture reference, and manifest re
 3. [Core Concepts & Resource Hierarchy](#core-concepts--resource-hierarchy)
 4. [Architecture & Request Flow](#architecture--request-flow)
 5. [Prerequisites](#prerequisites)
-6. [Step-by-Step GKE Deployment](#step-by-step-gke-deployment)
+6. [State Store Architecture: In-Cluster PostgreSQL vs. Cloud SQL](#state-store-architecture-in-cluster-postgresql-vs-cloud-sql)
+   - [When to Use In-Cluster PostgreSQL (Local / Dev)](#when-to-use-in-cluster-postgresql-local--dev)
+   - [When to Use Cloud SQL for PostgreSQL (Enterprise Production & DR)](#when-to-use-cloud-sql-for-postgresql-enterprise-production--dr)
+   - [Multi-Region Resilience & Disaster Recovery Matrix](#multi-region-resilience--disaster-recovery-matrix)
+7. [Step-by-Step GKE Deployment](#step-by-step-gke-deployment)
    - [Phase 1: VPC & Subnet Preparation](#phase-1-vpc--subnet-preparation)
    - [Phase 2: GKE Standard Cluster Creation](#phase-2-gke-standard-cluster-creation)
    - [Phase 3: Storage & Workload Identity](#phase-3-storage--workload-identity)
    - [Phase 4: Agent Substrate Control Plane Installation](#phase-4-agent-substrate-control-plane-installation)
-   - [Phase 5: Deploy WorkerPool & ComputeClass](#phase-5-deploy-workerpool--computeclass)
-7. [Deploying Your First Agent (Actor)](#deploying-your-first-agent-actor)
-8. [Suspend & Resume Lifecycle](#suspend--resume-lifecycle)
-9. [Scaling & Sizing Formula](#scaling--sizing-formula)
-10. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
-11. [Troubleshooting & Verification](#troubleshooting--verification)
+   - [Phase 5: Externalizing State to Cloud SQL for PostgreSQL (Production)](#phase-5-externalizing-state-to-cloud-sql-for-postgresql-production)
+   - [Phase 6: Deploy WorkerPool & ComputeClass](#phase-6-deploy-workerpool--computeclass)
+8. [Deploying Your First Agent (Actor)](#deploying-your-first-agent-actor)
+9. [Suspend & Resume Lifecycle](#suspend--resume-lifecycle)
+10. [Scaling & Sizing Formula](#scaling--sizing-formula)
+11. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
+12. [Troubleshooting & Verification](#troubleshooting--verification)
 
 ---
 
@@ -89,11 +94,13 @@ graph TD
             API["ate-api-server"]
             CTRL["ate-controller"]
             ROUTER["atenet-router (Envoy Ingress Gateway)"]
-            PG[("PostgreSQL DB<br/>Actor Registry & State")]
+            PROXY["cloud-sql-proxy (Auth Proxy Sidecar)"]
         end
 
-        subgraph GCS["Google Cloud Storage"]
-            BUCKET[("gs://ate-snapshots-...<br/>RAM & Disk Snapshots")]
+        subgraph MANAGED["Managed Google Cloud Services"]
+            PG[("Cloud SQL for PostgreSQL<br/>Actor Registry & State (Regional HA)")]
+            PG_DR[("Cross-Region Read Replica<br/>(Disaster Recovery Paired Region)")]
+            GCS[("gs://ate-snapshots-...<br/>RAM & Disk Snapshots (Dual-Region)")]
         end
 
         subgraph NP["Node Pool (C3 Standard VMs)"]
@@ -152,6 +159,35 @@ Before starting, ensure you have:
      storage.googleapis.com \
      iam.googleapis.com
    ```
+
+---
+
+## State Store Architecture: In-Cluster PostgreSQL vs. Cloud SQL
+
+Agent Substrate relies on a relational state store (`ate-api-server` metadata repository) to track Actor lifecycle states (`Running`, `Suspended`, `Terminated`), active session-to-worker placements, snapshot URIs, and resource accounting.
+
+Substrate supports two operational topologies for this database:
+
+| Feature / Dimension | In-Cluster PostgreSQL (Default Helm/Manifest) | Cloud SQL for PostgreSQL (Enterprise Production) |
+| :--- | :--- | :--- |
+| **Topology** | Runs inside GKE cluster as a `StatefulSet` with PVC | Managed GCP Service external to GKE cluster |
+| **Authentication** | Password or mTLS certs projected via K8s secrets | **Zero-Trust IAM Database Authentication** (no passwords) |
+| **High Availability** | Pod restarts / Kubernetes node rescheduling | **Regional HA** with automatic synchronous zone failover (99.95% SLA) |
+| **Multi-Region Disaster Recovery** | ❌ **Extremely Difficult**: State trapped on local cluster PVC |  **Native**: Asynchronous **Cross-Region Read Replicas** |
+| **Cluster Lifecycle Decoupling** | ❌ Tied to cluster lifecycle: deleting GKE cluster destroys metadata |  Decoupled: Destroying or recreating GKE clusters preserves all agent state |
+| **Connection Security** | In-cluster plaintext or self-managed TLS | **TLS 1.3 tunnel via Cloud SQL Auth Proxy sidecar** |
+| **Recommended Environment** | Local Kind, Dev/Test, ephemeral POCs | **Tier-1 Enterprise Production (e.g. Banking, Global Telecom)** |
+
+---
+
+### When to Use In-Cluster PostgreSQL (Local / Dev)
+- **Fast Local Prototyping**: Ideal for local `kind` clusters, sandbox sandpit environments, or initial developer testing where simplicity and zero GCP bill are prioritized.
+- **Single-Zone / Single-Cluster Scope**: Workloads where agent sessions are disposable and catastrophic regional failure does not require automated failover to a secondary site.
+
+### When to Use Cloud SQL for PostgreSQL (Enterprise Production & DR)
+- **High Availability & BCM SLAs**: Enterprise banking (such as HSBC) mandates strict Business Continuity Management (BCM) and Recovery Time Objectives (RTO < 60s).
+- **Multi-Region Cluster Topologies**: When running an active-passive or active-active GKE architecture across paired regions (e.g., London `europe-west2` and Belgium `europe-west1`), Cloud SQL provides **Cross-Region Replication**. If Region A goes dark, the secondary GKE cluster in Region B promotes the read replica and hydrates suspended actors directly from the paired GCS Dual-Region bucket without losing actor session registry state.
+- **Zero-Password Security Posture**: Uses GKE Workload Identity and `cloud-sql-proxy` with `CSQL_PROXY_AUTO_IAM_AUTHN=true`, eliminating static credentials from Kubernetes secrets or etcd.
 
 ---
 
@@ -248,7 +284,7 @@ Verify all control plane pods are running:
 ```bash
 kubectl get pods -n ate-system
 ```
-Expected output:
+Expected output (default in-cluster dev mode):
 ```
 NAME                                           READY   STATUS    RESTARTS   AGE
 ate-api-server-7b9c6f89b-8x2lq                 1/1     Running   0          2m
@@ -259,10 +295,44 @@ atelet-d5m8x                                   1/1     Running   0          2m
 atelet-x9p12                                   1/1     Running   0          2m
 atelet-y8q43                                   1/1     Running   0          2m
 pod-certificate-controller-74f4c9c4db-9zk5x    1/1     Running   0          2m
-postgres-0                                     1/1     Running   0          2m
+postgres-0                                     2/2     Running   0          2m
 ```
 
-### Phase 5: Deploy WorkerPool & ComputeClass
+### Phase 5: Externalizing State to Cloud SQL for PostgreSQL (Production)
+
+For production deployments, externalize the state store to Cloud SQL for PostgreSQL using the automated setup script:
+
+```bash
+# 1. Run the automated Cloud SQL provisioning & Workload Identity script
+./scripts/setup-cloudsql.sh
+```
+
+This automated script performs the following production configuration:
+1. Enables `sqladmin.googleapis.com`.
+2. Provisions a Regional HA PostgreSQL 15 instance (`substrate-pg-dev`) with IAM database authentication enabled (`cloudsql.iam_authentication=on`).
+3. Creates a dedicated Google Service Account (`ate-api-sql-sa`), grants `roles/cloudsql.client` and `roles/cloudsql.instanceUser`, and binds GKE Workload Identity to `ate-system/ate-api-server`.
+4. Populates `ate-api-server-envvars` ConfigMap with the instance connection name and proxy settings.
+5. Injects the native `cloud-sql-proxy` sidecar container into `ate-api-server` deployment via strategic-merge patch (`manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml`).
+6. Verifies rollout and connection health.
+
+Once verified, you can decommission the in-cluster `StatefulSet`:
+```bash
+kubectl delete statefulset postgres -n ate-system
+kubectl delete pvc -l app=postgres -n ate-system
+```
+
+Verify both replicas of `ate-api-server` are running with `2/2` containers (the `ateapi` app + `cloud-sql-proxy` sidecar):
+```bash
+kubectl get pods -n ate-system -l app=ate-api-server
+```
+Expected output:
+```
+NAME                             READY   STATUS    RESTARTS   AGE
+ate-api-server-66d5cbbd7-55psz   2/2     Running   0          2m
+ate-api-server-66d5cbbd7-mqsld   2/2     Running   0          2m
+```
+
+### Phase 6: Deploy WorkerPool & ComputeClass
 
 Create the Custom ComputeClass so GKE Node Auto-Provisioning automatically provisions C3 nodes for Workers:
 
@@ -463,7 +533,11 @@ $$\text{Max Actors per Worker} = \min\left( \frac{\text{Worker RAM} - \text{Over
 
 ## Production Best Practices & Pitfalls
 
-### 1. Homogeneous CPU Architectures
+### 1. Externalize State for Multi-Region Disaster Recovery
+> [!IMPORTANT]
+> Never run in-cluster PostgreSQL `StatefulSet` in multi-region production clusters. A cluster loss or regional outage traps all actor metadata on local PVCs. Always externalize state to **Cloud SQL for PostgreSQL with Cross-Region Read Replicas** paired with **Dual-Region GCS buckets** for actor memory snapshots.
+
+### 2. Homogeneous CPU Architectures
 > [!IMPORTANT]
 > Always pin your Worker node pools to a homogeneous CPU family (e.g. exclusively Google Compute Engine **C3** Intel Sapphire Rapids). 
 > Restoring a gVisor memory snapshot taken on an Intel CPU onto an AMD (or older Intel) node can cause CPU instruction set mismatches (`SIGILL` Illegal Instruction).

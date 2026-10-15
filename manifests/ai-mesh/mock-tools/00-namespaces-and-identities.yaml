@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-tools
+  labels:
+    # Ambient data plane activation
+    istio.io/dataplane-mode: ambient
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-workers
+  labels:
+    istio.io/dataplane-mode: ambient
+---
+# Service Accounts for Multi-Agent Workloads (Pillar 1: Policy Enforcement)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-agent-finance
+  namespace: ate-workers
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-agent-support
+  namespace: ate-workers

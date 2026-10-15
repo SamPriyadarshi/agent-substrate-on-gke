@@ -1,0 +1,134 @@
+# Pillar 5: Protocol-Aware Routing via Kubernetes Gateway API (HTTPRoute)
+# Routes MCP requests to corresponding backend tool based on headers or path
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-currency-route
+  namespace: mcp-tools
+spec:
+  parentRefs:
+  - group: ""
+    kind: Service
+    name: currency-tool
+    port: 8080
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: currency-tool
+      port: 8080
+    timeouts:
+      request: 30s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-database-route
+  namespace: mcp-tools
+spec:
+  parentRefs:
+  - group: ""
+    kind: Service
+    name: database-tool
+    port: 8080
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: database-tool
+      port: 8080
+    timeouts:
+      request: 30s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-search-route
+  namespace: mcp-tools
+spec:
+  parentRefs:
+  - group: ""
+    kind: Service
+    name: search-tool
+    port: 8080
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: search-tool
+      port: 8080
+    timeouts:
+      request: 30s
+---
+# Pillar 2: Traffic Management (Circuit Breaking & Outlier Detection)
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: mcp-currency-resilience
+  namespace: mcp-tools
+spec:
+  host: currency-tool.mcp-tools.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 10
+        maxRequestsPerConnection: 50
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+---
+# Pillar 2: Token-bucket Rate Limiting for runaway agent loops
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: mcp-agent-rate-limit
+  namespace: mcp-tools
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: waypoint
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.local_ratelimit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+          stat_prefix: mcp_rate_limiter
+          token_bucket:
+            max_tokens: 10
+            tokens_per_fill: 10
+            fill_interval: 1s
+          filter_enabled:
+            runtime_key: local_rate_limit_enabled
+            default_value:
+              numerator: 100
+              denominator: HUNDRED
+          filter_enforced:
+            runtime_key: local_rate_limit_enforced
+            default_value:
+              numerator: 100
+              denominator: HUNDRED
+          response_headers_to_add:
+          - append_action: OVERWRITE_IF_EXISTS_OR_ADD
+            header:
+              key: x-rate-limited
+              value: "true"

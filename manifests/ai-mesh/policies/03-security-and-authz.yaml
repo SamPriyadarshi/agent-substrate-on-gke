@@ -1,0 +1,60 @@
+# Pillar 4: Strict mTLS throughout the service mesh (Ambient HBONE enforcement)
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default-strict-mtls
+  namespace: mcp-tools
+spec:
+  mtls:
+    mode: STRICT
+---
+# Pillar 1: Policy Enforcement targeting currency-tool Service
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-currency-tool
+  namespace: mcp-tools
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    name: currency-tool
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/ate-workers/sa/sa-agent-finance"]
+---
+# Pillar 1: Policy Enforcement targeting database-tool Service
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-database-tool
+  namespace: mcp-tools
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    name: database-tool
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/ate-workers/sa/sa-agent-finance"]
+---
+# Pillar 1: Policy Enforcement targeting search-tool Service
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-search-tool
+  namespace: mcp-tools
+spec:
+  targetRef:
+    group: ""
+    kind: Service
+    name: search-tool
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/ate-workers/sa/sa-agent-support"]

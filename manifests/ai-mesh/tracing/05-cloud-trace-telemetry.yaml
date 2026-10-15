@@ -1,0 +1,23 @@
+# Pillar 3: Distributed Observability (Google Cloud Trace via OpenTelemetry)
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: gke-cloud-trace-telemetry
+  namespace: mcp-tools
+spec:
+  tracing:
+  - providers:
+    - name: "google-cloud-trace"
+    randomSamplingPercentage: 100.0
+    customTags:
+      "ai.mcp.tool":
+        header:
+          name: "x-mcp-tool"
+          defaultValue: "unknown"
+      "ai.agent.principal":
+        environment:
+          name: "POD_NAME"
+          defaultValue: "agent-caller"
+  accessLogging:
+  - providers:
+    - name: "envoy"
