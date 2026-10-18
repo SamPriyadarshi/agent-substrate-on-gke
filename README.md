@@ -18,20 +18,17 @@ A comprehensive, production-grade guide, architecture reference, and manifest re
 6. [State Store Architecture: In-Cluster PostgreSQL vs. Cloud SQL](#state-store-architecture-in-cluster-postgresql-vs-cloud-sql)
    - [When to Use In-Cluster PostgreSQL (Local / Dev)](#when-to-use-in-cluster-postgresql-local--dev)
    - [When to Use Cloud SQL for PostgreSQL (Enterprise Production & DR)](#when-to-use-cloud-sql-for-postgresql-enterprise-production--dr)
-   - [Multi-Region Resilience & Disaster Recovery Matrix](#multi-region-resilience--disaster-recovery-matrix)
 7. [Step-by-Step GKE Deployment](#step-by-step-gke-deployment)
-   - [Phase 1: VPC & Subnet Preparation](#phase-1-vpc--subnet-preparation)
-   - [Phase 2: GKE Standard Cluster Creation](#phase-2-gke-standard-cluster-creation)
-   - [Phase 3: Storage & Workload Identity](#phase-3-storage--workload-identity)
-   - [Phase 4: Agent Substrate Control Plane Installation](#phase-4-agent-substrate-control-plane-installation)
-   - [Phase 5: Externalizing State to Cloud SQL for PostgreSQL (Production)](#phase-5-externalizing-state-to-cloud-sql-for-postgresql-production)
-   - [Phase 6: Deploy WorkerPool & ComputeClass](#phase-6-deploy-workerpool--computeclass)
-8. [Deploying Your First Agent (Actor)](#deploying-your-first-agent-actor)
-9. [Suspend & Resume Lifecycle](#suspend--resume-lifecycle)
-10. [Scaling & Sizing Formula](#scaling--sizing-formula)
-11. [AI Tool Mesh & MCP Governance (Istio Ambient)](#ai-tool-mesh--mcp-governance-istio-ambient)
-12. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
-13. [Troubleshooting & Verification](#troubleshooting--verification)
+   - [Phase 1: VPC, Subnet & Cloud NAT](#phase-1-vpc-subnet--cloud-nat)
+   - [Phase 2: Private GKE Cluster](#phase-2-private-gke-cluster)
+   - [Phase 3: Snapshot Bucket, Image Registry & Workload Identity](#phase-3-snapshot-bucket-image-registry--workload-identity)
+   - [Phase 4: Install Agent Substrate (choose a state store)](#phase-4-install-agent-substrate-choose-a-state-store)
+   - [Phase 5: Verify with the Counter Demo](#phase-5-verify-with-the-counter-demo)
+8. [Suspend & Resume Lifecycle](#suspend--resume-lifecycle)
+9. [Scaling & Sizing Formula](#scaling--sizing-formula)
+10. [AI Tool Mesh & MCP Governance (Istio Ambient)](#ai-tool-mesh--mcp-governance-istio-ambient)
+11. [Production Best Practices & Pitfalls](#production-best-practices--pitfalls)
+12. [Troubleshooting & Verification](#troubleshooting--verification)
 
 ---
 
@@ -134,7 +131,7 @@ graph TD
     USER["Client Application"] -->|"HTTP Request<br/>Header: ate-target-actor: tenant/agent-1"| ROUTER
     ROUTER -->|"Lookup Actor Location"| API
     API -->|"localhost:5432"| PROXY
-    PROXY -->|"TLS + IAM token"| PG
+    PROXY -->|"TLS + IAM token via PSC endpoint"| PG
     PG -.->|"Optional replication"| PG_DR
     ROUTER -->|"Direct Forward (mTLS)"| POD1
     POD1 -->|"Dispatches into Sandbox"| ACTOR1
@@ -152,16 +149,17 @@ graph TD
 ## Prerequisites
 
 Before starting, ensure you have:
-1. **Google Cloud SDK (`gcloud`)** version $\ge$ 480.0.0.
-2. **`kubectl`** matching cluster version ($\ge$ 1.30).
-3. **`kubectl-ate`** CLI plugin installed.
-4. GCP IAM permissions: `roles/container.admin`, `roles/storage.admin`, `roles/iam.serviceAccountAdmin`.
+1. **Google Cloud SDK (`gcloud`)**, recent enough for `--enable-dns-access` and `--dns-endpoint` on GKE clusters.
+2. **`kubectl`** (1.36 or later).
+3. **Go 1.27+** and **Docker with the buildx plugin**: the upstream installer builds Agent Substrate's images from source.
+4. GCP IAM permissions to create VPCs, GKE clusters, Cloud Storage buckets, Artifact Registry repositories and IAM bindings (for Option B also Cloud SQL, Cloud DNS and service accounts).
 5. A GCP project with billing enabled and the following APIs activated:
    ```bash
    gcloud services enable \
      container.googleapis.com \
      compute.googleapis.com \
      storage.googleapis.com \
+     artifactregistry.googleapis.com \
      iam.googleapis.com
    ```
 
@@ -198,325 +196,197 @@ Substrate supports two operational topologies for this database:
 
 ## Step-by-Step GKE Deployment
 
-### Phase 1: VPC & Subnet Preparation
+Phases 1–3 prepare a private GKE cluster. Phase 4 installs Agent Substrate with the upstream installer (`ate-setup`), and you pick **one** state store: **Option A** (built-in PostgreSQL) or **Option B** (Cloud SQL over Private Service Connect). Phase 5 checks the install with the upstream counter demo.
 
-GKE clusters running Agent Substrate benefit from a dedicated subnet with Dataplane V2 enabled:
+> [!NOTE]
+> Option B was validated end to end on a fresh GKE 1.36 cluster with Agent Substrate **v0.5.0**: install, actor create, resume through the router, suspend to GCS, and resume on a different worker with state intact.
+
+### Phase 1: VPC, Subnet & Cloud NAT
 
 ```bash
-PROJECT_ID="your-gcp-project"
-REGION="us-central1"
-ZONE="us-central1-a"
-VPC_NAME="agent-vpc"
-SUBNET_NAME="agent-substrate-subnet"
+export PROJECT_ID="your-gcp-project"
+export REGION="us-central1"
+export ZONE="us-central1-a"
+export VPC_NAME="agent-vpc"
+export SUBNET_NAME="agent-substrate-subnet"
 
-# 1. Create VPC network (if not existing)
 gcloud compute networks create ${VPC_NAME} --subnet-mode=custom
-
-# 2. Create Subnetwork with secondary ranges for Pods and Services
 gcloud compute networks subnets create ${SUBNET_NAME} \
-  --network=${VPC_NAME} \
-  --region=${REGION} \
+  --network=${VPC_NAME} --region=${REGION} \
   --range=10.60.0.0/20 \
-  --secondary-range=agent-pods=10.70.0.0/16,agent-services=10.80.0.0/20
+  --secondary-range=agent-pods=10.70.0.0/16,agent-services=10.80.0.0/20 \
+  --enable-private-ip-google-access
+gcloud compute firewall-rules create ${VPC_NAME}-allow-internal --network=${VPC_NAME} \
+  --allow=tcp,udp,icmp --source-ranges=10.60.0.0/20,10.70.0.0/16,10.80.0.0/20
+
+# Private nodes have no external IPs; Cloud NAT gives them egress to pull public images.
+gcloud compute routers create ${VPC_NAME}-router --network=${VPC_NAME} --region=${REGION}
+gcloud compute routers nats create ${VPC_NAME}-nat --router=${VPC_NAME}-router --region=${REGION} \
+  --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
 ```
 
-### Phase 2: GKE Standard Cluster Creation
-
-Deploy a GKE Standard cluster with **Node Auto-Provisioning (NAP)**, **Dataplane V2**, and the required **Beta mTLS Certificate APIs**:
+### Phase 2: Private GKE Cluster
 
 ```bash
-CLUSTER_NAME="agent-substrate-cluster"
+export CLUSTER_NAME="agent-substrate-cluster"
 
 gcloud container clusters create ${CLUSTER_NAME} \
   --zone=${ZONE} \
-  --cluster-version=1.36.4-gke.2046000 \
-  --network=${VPC_NAME} \
-  --subnetwork=${SUBNET_NAME} \
+  --release-channel=rapid --cluster-version=1.36 \
+  --network=${VPC_NAME} --subnetwork=${SUBNET_NAME} \
   --enable-ip-alias \
   --cluster-secondary-range-name=agent-pods \
   --services-secondary-range-name=agent-services \
-  --machine-type=c3-standard-4 \
-  --num-nodes=3 \
+  --enable-private-nodes --master-ipv4-cidr=172.16.0.32/28 \
+  --enable-dns-access \
+  --machine-type=c3-standard-4 --num-nodes=3 \
   --enable-dataplane-v2 \
   --workload-pool=${PROJECT_ID}.svc.id.goog \
   --enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles \
-  --enable-autoprovisioning \
-  --min-cpu=1 \
-  --max-cpu=64 \
-  --min-memory=4 \
-  --max-memory=256 \
-  --enable-autoprovisioning-autorepair \
-  --enable-autoprovisioning-autoupgrade \
-  --enable-shielded-nodes \
-  --shielded-secure-boot \
-  --shielded-integrity-monitoring
+  --enable-autoprovisioning --min-cpu=1 --max-cpu=64 --min-memory=4 --max-memory=256 \
+  --enable-autoprovisioning-autorepair --enable-autoprovisioning-autoupgrade \
+  --enable-shielded-nodes --shielded-secure-boot --shielded-integrity-monitoring
+
+gcloud container clusters get-credentials ${CLUSTER_NAME} --zone=${ZONE} --dns-endpoint
 ```
 
-> **Why C3 VMs?** GCE C3 machine types (Intel Sapphire Rapids) provide deterministic CPU instruction sets, which is critical for consistent memory checkpointing (`gVisor save/restore`) across different nodes.
+- **Kubernetes 1.36 or later** with both beta certificate APIs is required by Agent Substrate.
+- **Private nodes** keep worker VMs off the internet. They're also required in projects with the common `constraints/compute.vmExternalIpAccess` organization policy, where public nodes fail to start.
+- **The DNS-based control-plane endpoint** (`--enable-dns-access`, `--dns-endpoint`) gives you IAM-authenticated `kubectl` access without maintaining an IP allowlist.
+- **Why C3 VMs?** GCE C3 machine types (Intel Sapphire Rapids) provide deterministic CPU instruction sets, which is critical for consistent memory checkpointing (`gVisor save/restore`) across different nodes.
 
-### Phase 3: Storage & Workload Identity
-
-Agent Substrate requires a Cloud Storage bucket for saving memory and filesystem snapshots when actors hibernate:
+### Phase 3: Snapshot Bucket, Image Registry & Workload Identity
 
 ```bash
-BUCKET_NAME="ate-snapshots-${PROJECT_ID}-${REGION}"
+export PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)')
+export BUCKET_NAME="ate-snapshots-${PROJECT_ID}-${REGION}"
+export KO_DOCKER_REPO="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-substrate"
+WI="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/ate-system/sa"
 
-# 1. Create GCS bucket
-gcloud storage buckets create gs://${BUCKET_NAME} \
-  --location=${REGION} \
-  --uniform-bucket-level-access
+# 1. Snapshot bucket: atelet and ate-api-server read and write snapshots through Workload Identity
+gcloud storage buckets create gs://${BUCKET_NAME} --location=${REGION} --uniform-bucket-level-access
+for SA in atelet ate-api-server; do
+  for ROLE in roles/storage.objectAdmin roles/storage.bucketViewer; do
+    gcloud storage buckets add-iam-policy-binding gs://${BUCKET_NAME} --member="${WI}/${SA}" --role=${ROLE}
+  done
+done
 
-# 2. Grant Workload Identity permissions to atelet and ate-api-server
-gcloud storage buckets add-iam-policy-binding gs://${BUCKET_NAME} \
-  --member="principal://iam.googleapis.com/projects/$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)')/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/ate-system/sa/atelet" \
-  --role="roles/storage.objectAdmin"
-
-gcloud storage buckets add-iam-policy-binding gs://${BUCKET_NAME} \
-  --member="principal://iam.googleapis.com/projects/$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)')/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/ate-system/sa/ate-api-server" \
-  --role="roles/storage.objectAdmin"
+# 2. Artifact Registry for the images the installer builds from source
+gcloud artifacts repositories create agent-substrate --repository-format=docker --location=${REGION}
+gcloud artifacts repositories add-iam-policy-binding agent-substrate --location=${REGION} \
+  --member="${WI}/atelet" --role=roles/artifactregistry.reader
+gcloud artifacts repositories add-iam-policy-binding agent-substrate --location=${REGION} \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role=roles/artifactregistry.reader
+gcloud auth configure-docker ${REGION}-docker.pkg.dev
 ```
-
-### Phase 4: Agent Substrate Control Plane Installation
-
-Apply the Substrate control plane manifests:
-
-```bash
-# Apply namespaces, CRDs, and controllers
-kubectl apply -k manifests/ate-install/
-```
-
-Verify all control plane pods are running:
-```bash
-kubectl get pods -n ate-system
-```
-Expected output (default in-cluster dev mode):
-```
-NAME                                           READY   STATUS    RESTARTS   AGE
-ate-api-server-7b9c6f89b-8x2lq                 1/1     Running   0          2m
-ate-controller-5df84b7f4-m9xpk                 1/1     Running   0          2m
-atenet-egress-84c688d66-r2zlw                  1/1     Running   0          2m
-atenet-router-69c76b9f4f-4tk2b                 1/1     Running   0          2m
-atelet-d5m8x                                   1/1     Running   0          2m
-atelet-x9p12                                   1/1     Running   0          2m
-atelet-y8q43                                   1/1     Running   0          2m
-pod-certificate-controller-74f4c9c4db-9zk5x    1/1     Running   0          2m
-postgres-0                                     2/2     Running   0          2m
-```
-
-### Phase 5: Externalizing State to Cloud SQL for PostgreSQL (Production)
-
-The default install keeps `ate-api-server`'s state in the in-cluster `postgres-0` StatefulSet. For production, move it to Cloud SQL for PostgreSQL. `ate-api-server` reaches Cloud SQL through the Cloud SQL Auth Proxy sidecar, and the proxy authenticates as a Google service account (GSA) through Workload Identity using IAM database authentication. No database password is stored in the cluster.
-
-**Before you start:** suspend every actor (`kubectl ate get actors -a <atespace>`, then `kubectl ate suspend actor ...`). The copy needs a quiesced control plane with no actor assigned to a worker; the script checks this and stops if any actor is still running. Expect a few minutes of control-plane downtime while the data is copied.
-
-```bash
-PROJECT_ID=your-gcp-project REGION=us-central1 ./scripts/setup-cloudsql.sh
-```
-
-Optional settings: `INSTANCE_NAME`, `DB_NAME` (default `atepg`), `DB_VERSION` (default `POSTGRES_15`), `AVAILABILITY_TYPE` (`ZONAL` by default; use `REGIONAL` for HA), `GSA_NAME`, `BUCKET_NAME`, and `MIGRATE_DATA=false` to start with an empty database instead of copying.
-
-What [`scripts/setup-cloudsql.sh`](scripts/setup-cloudsql.sh) does. It is idempotent and safe to re-run:
-
-1. **Backs up** the current `ate-api-server` Secret, ConfigMap and Deployment to a local `cloudsql-backup-<timestamp>/` directory.
-2. **Provisions** the Cloud SQL instance with `cloudsql.iam_authentication=on`, plus the database, if they don't exist.
-3. **Sets up identity:**
-   - creates the GSA and grants it `roles/cloudsql.client` and `roles/cloudsql.instanceUser`
-   - binds Workload Identity to `ate-system/ate-api-server` and annotates that ServiceAccount
-   - grants the GSA `storage.objectAdmin` and `storage.bucketViewer` on the snapshot bucket
-4. **Creates the IAM database user** and runs the one-time `GRANT CREATE` on the database and `public` schema. It uses a temporary `postgres` password that is scrambled when the script exits.
-5. **Copies the data**, if the target database is empty and `postgres-0` is in use:
-   - scales `ate-api-server` to 0 and dumps `postgres-0`
-   - restores the dump in a single transaction as the IAM user, so that user owns every table
-   - checks that every table's row count matches
-   - on any mismatch or error, scales `ate-api-server` back up on the in-cluster database and stops
-   - never overwrites a database that already has tables
-6. **Switches `ate-api-server` to Cloud SQL:**
-   - writes the connection string to the Secret `ate-api-server-secret-envvars`
-   - writes the proxy settings to the ConfigMap `ate-api-server-envvars`
-   - injects the sidecar from [`proxy-sidecar-patch.yaml`](manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml) and rolls out the pods
-7. **Verifies the switch**, and fails if any check doesn't pass:
-   - each pod's proxy has accepted connections
-   - `ate-api-server` reports `PostgreSQL migrations ready`
-   - Cloud SQL shows sessions from the IAM user
-   - `postgres-0` has **no** connections from `ate-api-server`
-
-> [!IMPORTANT]
-> **Three things that break this migration if done by hand:**
-> 1. **The connection string lives in the Secret, not the ConfigMap.** `ate-api-server` reads the ConfigMap first and the Secret second, so the Secret wins. Changing only the ConfigMap leaves `ate-api-server` on `postgres-0` while the proxy sidecar sits idle.
-> 2. **Cloud SQL IAM users start with no privileges.** PostgreSQL 15 and later removed `CREATE` on the `public` schema for regular users. Without the one-time `GRANT`, `ate-api-server` fails with `permission denied for schema public`.
-> 3. **Annotating the ServiceAccount with a GSA changes `ate-api-server`'s Cloud Storage identity too.** If the GSA lacks the snapshot-bucket roles, suspends fail with `PermissionDenied ... storage.objects.list`.
-
-Check the result yourself:
-
-```bash
-# Both replicas run the ateapi container plus the cloud-sql-proxy sidecar (2/2)
-kubectl get pods -n ate-system -l app=ate-api-server
-
-# The proxy is carrying ateapi's database traffic
-kubectl logs -n ate-system deploy/ate-api-server -c cloud-sql-proxy | grep "Accepted connection"
-
-# The in-cluster database no longer has connections from ate-api-server
-kubectl exec -n ate-system postgres-0 -c postgres -- \
-  psql -U postgres -d atepg -c "select client_addr, count(*) from pg_stat_activity where datname='atepg' group by 1;"
-
-# A suspend and resume round trip works end to end
-kubectl ate suspend actor <name> -a <atespace> && kubectl ate resume actor <name> -a <atespace>
-```
-
-**Rollback:** `postgres-0` is left untouched. To return to it, run `kubectl apply -f cloudsql-backup-<timestamp>/secret.yaml && kubectl -n ate-system rollout restart deployment/ate-api-server`. Changes made after the switch exist only in Cloud SQL. When you are confident, stop the in-cluster database with `kubectl -n ate-system scale statefulset postgres --replicas=0`, and keep its PVC until you are sure you no longer need it.
 
 > [!NOTE]
-> The script covers a single Cloud SQL instance. HA failover drills and cross-region read replicas for disaster recovery are separate steps that this repository does not automate.
+> Workload Identity principals (`.../ns/ate-system/sa/atelet`) are shared by every cluster in the project. Granting on the bucket and repository, rather than the project, keeps each install's access scoped.
 
-### Phase 6: Deploy WorkerPool & ComputeClass
+### Phase 4: Install Agent Substrate (choose a state store)
 
-Create the Custom ComputeClass so GKE Node Auto-Provisioning automatically provisions C3 nodes for Workers:
-
-```yaml
-# manifests/computeclass-agent-worker.yaml
-apiVersion: cloud.google.com/v1
-kind: ComputeClass
-metadata:
-  name: agent-worker-class
-spec:
-  nodePoolSettings:
-    machineFamily: c3
-    labels:
-      agent-substrate.io/role: worker
-    taints:
-      - key: agent-substrate.io/role
-        value: worker
-        effect: NoSchedule
-```
-
-Create the `WorkerPool` with sizing for up to 100 actors per worker:
-
-```yaml
-# manifests/workerpool-c3.yaml
-apiVersion: substrate.google.com/v1alpha1
-kind: WorkerPool
-metadata:
-  name: c3-agent-workers
-  namespace: demo-agents
-spec:
-  replicas: 2
-  template:
-    metadata:
-      labels:
-        agent-substrate.io/role: worker
-    spec:
-      tolerations:
-      - key: "agent-substrate.io/role"
-        operator: "Equal"
-        value: "worker"
-        effect: "NoSchedule"
-      containers:
-      - name: worker
-        image: us-docker.pkg.dev/gke-substrate-release/substrate/ateom-gvisor:v0.2.0-gke.0
-        resources:
-          requests:
-            cpu: "8"
-            memory: "28Gi"
-          limits:
-            cpu: "12"
-            memory: "32Gi"
-        env:
-        - name: ATEOM_MAX_ACTORS
-          value: "100"
-```
-
-Apply both manifests:
-```bash
-kubectl apply -f manifests/computeclass-agent-worker.yaml
-kubectl apply -f manifests/workerpool-c3.yaml
-```
-
----
-
-## Deploying Your First Agent (Actor)
-
-### 1. Create the Tenant Space (`Atespace`)
-```yaml
-# manifests/demo-tenant.yaml
-apiVersion: substrate.google.com/v1alpha1
-kind: Atespace
-metadata:
-  name: demo-tenant
-```
-
-### 2. Define the Agent Template (`ActorTemplate`)
-```yaml
-# manifests/actortemplate-python.yaml
-apiVersion: substrate.google.com/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: python-agent
-  namespace: demo-tenant
-spec:
-  idleTimeout: "30s" # Hibernate to GCS after 30 seconds of inactivity
-  resources:
-    requests:
-      cpu: "100m"
-      memory: "256Mi"
-    limits:
-      cpu: "500m"
-      memory: "512Mi"
-  template:
-    spec:
-      containers:
-      - name: agent
-        image: python:3.11-slim
-        command: ["python3", "-u", "-c"]
-        args:
-        - |
-          import http.server, socketserver, json, os
-          class Handler(http.server.SimpleHTTPRequestHandler):
-              def do_POST(self):
-                  length = int(self.headers.get('content-length', 0))
-                  body = self.rfile.read(length).decode('utf-8')
-                  resp = {"status": "ok", "echo": body, "pid": os.getpid()}
-                  self.send_response(200)
-                  self.send_header('Content-Type', 'application/json')
-                  self.end_headers()
-                  self.wfile.write(json.dumps(resp).encode('utf-8'))
-          with socketserver.TCPServer(("", 8080), Handler) as httpd:
-              httpd.serve_forever()
-        ports:
-        - containerPort: 8080
-```
-
-### 3. Create the Actor
-```yaml
-# manifests/actor-devops-1.yaml
-apiVersion: substrate.google.com/v1alpha1
-kind: Actor
-metadata:
-  name: devops-agent-1
-  namespace: demo-tenant
-spec:
-  templateRef:
-    name: python-agent
-```
-
-Apply:
-```bash
-kubectl apply -f manifests/demo-tenant.yaml
-kubectl apply -f manifests/actortemplate-python.yaml
-kubectl apply -f manifests/actor-devops-1.yaml
-```
-
-### 4. Send Traffic to the Actor
-Routing is handled through the `atenet-router` Envoy gateway. The target actor is specified using the `ate-target-actor` header:
+The installer builds every image from source. You need **Go 1.27+** and **Docker with the buildx plugin**, which is used for the `envoy-dataplane` image.
 
 ```bash
-ROUTER_IP=$(kubectl get svc atenet-router -n ate-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+git clone --branch v0.5.0 --depth 1 https://github.com/agent-substrate/substrate.git
+cd substrate
 
-curl -X POST http://${ROUTER_IP}:8080/ \
-  -H "Host: atenet-router.ate-system.svc.cluster.local" \
-  -H "ate-target-actor: demo-tenant/devops-agent-1" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Hello from Agent Substrate!"}'
+export CLUSTER_LOCATION=${ZONE}
+export KUBECTL_CONTEXT=$(kubectl config current-context)
+export NO_DEV_ENV=true
+export KO_DEFAULTPLATFORMS=linux/amd64
 ```
+
+| | **Option A: Built-in PostgreSQL** | **Option B: Cloud SQL over PSC** |
+| :--- | :--- | :--- |
+| **Use for** | Dev, test, short-lived POCs | Production |
+| **Database** | `postgres-0` StatefulSet inside the cluster | Managed Cloud SQL for PostgreSQL, outside the cluster |
+| **Network path** | In-cluster | Private Service Connect endpoint in your subnet; the instance has no public or private IP |
+| **Credentials** | In-cluster certificates | IAM database authentication through the Cloud SQL Auth Proxy; no passwords |
+| **Survives cluster deletion** | ❌ | ✅ |
+
+#### Option A: Built-in PostgreSQL
+
+```bash
+./hack/install-ate.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
+kubectl get pods -n ate-system   # includes postgres-0
+```
+
+#### Option B: Cloud SQL for PostgreSQL over Private Service Connect
+
+**Step 1: Provision Cloud SQL** with [`scripts/setup-cloudsql.sh`](scripts/setup-cloudsql.sh) from your clone of this repository. It is idempotent and safe to re-run:
+
+```bash
+NETWORK=${VPC_NAME} SUBNET=${SUBNET_NAME} /path/to/agent-substrate-on-gke/scripts/setup-cloudsql.sh
+```
+
+Optional settings: `INSTANCE_NAME` (default `ate-substrate-pg`), `GSA_NAME` (default `ate-api-server`), `DB_TIER`, `AVAILABILITY_TYPE=REGIONAL` for HA, and `DELETION_PROTECTION` (default `true`).
+
+The script creates:
+- **The instance:** a Cloud SQL instance (PostgreSQL 18, Enterprise) with **only** Private Service Connect enabled. It has no public IP and no VPC peering, and it has IAM database authentication, automated backups and point-in-time recovery.
+- **Connectivity:** a PSC endpoint, which is an internal IP in your subnet, plus a private Cloud DNS record for the instance's DNS name. The Cloud SQL Auth Proxy needs that DNS record in PSC mode.
+- **Identity:**
+  - the Google service account `ate-api-server` uses through Workload Identity, with `roles/cloudsql.client` and `roles/cloudsql.instanceUser`
+  - the snapshot-bucket roles for that service account
+  - the IAM database user
+- **Database setup:** the roles and schema Agent Substrate expects (`substrate_owner`, `substrate_readwrite`, schema `substrate`). It verifies them afterwards and fails if anything is missing.
+
+It finishes by printing the variables for Step 2.
+
+**Step 2: Install**, from the `substrate` checkout:
+
+```bash
+export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=${PROJECT_ID}:${REGION}:ate-substrate-pg
+export ATE_API_POSTGRES_CLOUDSQL_GSA=ate-api-server@${PROJECT_ID}.iam.gserviceaccount.com
+export ATE_API_POSTGRES_CLOUDSQL_IP_TYPE=psc
+./hack/install-ate.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
+```
+
+The installer skips the bundled PostgreSQL, adds the `cloud-sql-proxy` sidecar to `ate-api-server`, and writes a passwordless connection string. Check it:
+
+```bash
+kubectl get pods -n ate-system   # no postgres-0; ate-api-server pods are 3/3 (ateapi, objectstore-plugin, cloud-sql-proxy)
+kubectl get configmap ate-api-server-envvars -n ate-system -o jsonpath='{.data.CSQL_PROXY_PSC}'   # true
+kubectl logs -n ate-system deploy/ate-api-server -c ate-api-server | grep "PostgreSQL migrations ready"
+```
+
+> [!IMPORTANT]
+> **Three things that break a Cloud SQL install, all handled by the script:**
+> 1. **The service account annotation also moves snapshot access to the GSA.** The installer annotates the `ate-api-server` ServiceAccount with the GSA. After that, every Google API call from that pod uses the GSA, including the objectstore-plugin's snapshot access. If the GSA lacks the snapshot-bucket roles, snapshot operations fail with `PermissionDenied`.
+> 2. **The roles and schema must exist before first start.** Otherwise `ate-api-server` crash-loops with `role "substrate_readwrite" does not exist`.
+> 3. **PSC needs a DNS record.** The proxy reaches a PSC instance through its DNS name, so a private DNS record must point that name at the PSC endpoint.
+
+> [!NOTE]
+> **Fallback: VPC peering (private IP) instead of PSC.** Upstream's `go run ./tools/setup-gcp create cloudsql --region=${REGION}` provisions a private-IP instance over private services access. Then:
+> 1. Run the one-time SQL in upstream's [`tools/setup-gcp/cloud-sql.md`](https://github.com/agent-substrate/substrate/blob/v0.5.0/tools/setup-gcp/cloud-sql.md).
+> 2. Grant the GSA the two snapshot-bucket roles yourself.
+> 3. Install with `ATE_API_POSTGRES_CLOUDSQL_IP_TYPE=private`.
+>
+> This path is not covered by this repository's script.
+
+### Phase 5: Verify with the Counter Demo
+
+From the `substrate` checkout:
+
+```bash
+./hack/install-ate.sh --deploy-demo-counter
+go install ./cmd/kubectl-ate
+
+kubectl ate create actor my-counter-1 -a ate-demo-counter --template counter
+kubectl port-forward -n ate-system svc/atenet-router 8000:80   # keep running in a separate terminal
+
+# The first request wakes the actor; each request increments its counters
+curl -X POST -H "ate-target-actor: ate-demo-counter/my-counter-1" http://localhost:8000
+# hello from: ... | preserved memory count: 1 | preserved file counter: 1 | preserved rootfs counter: 1
+
+# Suspend to GCS, then send another request: the counts continue from where they were
+kubectl ate suspend actor my-counter-1 -a ate-demo-counter
+curl -X POST -H "ate-target-actor: ate-demo-counter/my-counter-1" http://localhost:8000
+# hello from: ... | preserved memory count: 2 | preserved file counter: 2 | preserved rootfs counter: 2
+```
+
+Actors, actor templates and atespaces are managed with `kubectl ate` through the Agent Substrate API, not with `kubectl apply`. For other workloads, see the upstream [`demos/`](https://github.com/agent-substrate/substrate/tree/v0.5.0/demos).
 
 ---
 
@@ -624,17 +494,17 @@ For full details on manifests, CRDs, and configurations, see the [AI Mesh Docume
 > Always pin your Worker node pools to a homogeneous CPU family (e.g. exclusively Google Compute Engine **C3** Intel Sapphire Rapids). 
 > Restoring a gVisor memory snapshot taken on an Intel CPU onto an AMD (or older Intel) node can cause CPU instruction set mismatches (`SIGILL` Illegal Instruction).
 
-### 2. Private Clusters & Shielded VMs
+### 3. Private Clusters & Shielded VMs
 - Ensure `--enable-private-nodes` is enabled.
 - Enforce `--shielded-secure-boot` and `--shielded-integrity-monitoring` to comply with enterprise Org Policies.
 
-### 3. Dedicated Secondary IP Ranges
+### 4. Dedicated Secondary IP Ranges
 - Avoid running out of Pod IPs. For high-density setups, ensure your Pod secondary subnet CIDR is at least `/16` (65,536 IPs).
 
-### 4. Granular Egress Policies
+### 5. Granular Egress Policies
 - Agents generating arbitrary code must never have unrestricted access to VPC internal services. Use Substrate `EgressPolicy` CRDs to whitelist only required endpoints (e.g., Cloud TPU port 8000, Vertex AI, or specific internet APIs).
 
-### 5. Idle Timeout Tuning
+### 6. Idle Timeout Tuning
 - Set `idleTimeout: "30s"` to `"60s"` for interactive multi-turn chat applications to avoid thrashing snapshots between closely spaced user turns.
 - Set `idleTimeout: "10s"` for batch or background agents to immediately reclaim worker memory.
 
@@ -647,20 +517,21 @@ For full details on manifests, CRDs, and configurations, see the [AI Mesh Docume
 # Check status of Substrate control plane
 kubectl get pods -n ate-system
 
-# Check active workers and their allocated actor density
+# Check workers
 kubectl ate get workers
 
-# Check status of registered actors
-kubectl ate get actors -n demo-tenant
+# Check actors in an atespace
+kubectl ate get actors -a ate-demo-counter
 
 # Stream logs from a specific actor
-kubectl ate logs devops-agent-1 -n demo-tenant -f
+kubectl ate logs actor my-counter-1 -a ate-demo-counter -f
 
-# Force suspend an actor manually
-kubectl ate suspend devops-agent-1 -n demo-tenant
+# Suspend or resume an actor manually
+kubectl ate suspend actor my-counter-1 -a ate-demo-counter
+kubectl ate resume actor my-counter-1 -a ate-demo-counter
 
-# Force resume an actor manually
-kubectl ate resume devops-agent-1 -n demo-tenant
+# Option B: confirm ate-api-server reaches Cloud SQL through the proxy
+kubectl logs -n ate-system deploy/ate-api-server -c cloud-sql-proxy | grep "Accepted connection"
 ```
 
 ---
