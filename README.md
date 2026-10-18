@@ -92,16 +92,12 @@ GKE Cluster
 graph TD
     subgraph GKE["GKE Cluster (agent-substrate-cluster)"]
         subgraph CP["Control Plane (ate-system)"]
-            API["ate-api-server"]
+            subgraph APIPOD["ate-api-server Pod"]
+                API["ate-api-server"]
+                PROXY["cloud-sql-proxy sidecar<br/>(IAM auth via Workload Identity)"]
+            end
             CTRL["ate-controller"]
             ROUTER["atenet-router (Envoy Ingress Gateway)"]
-            PROXY["cloud-sql-proxy (Auth Proxy Sidecar)"]
-        end
-
-        subgraph MANAGED["Managed Google Cloud Services"]
-            PG[("Cloud SQL for PostgreSQL<br/>Actor Registry & State (Regional HA)")]
-            PG_DR[("Cross-Region Read Replica<br/>(Disaster Recovery Paired Region)")]
-            GCS[("gs://ate-snapshots-...<br/>RAM & Disk Snapshots (Dual-Region)")]
         end
 
         subgraph NP["Node Pool (C3 Standard VMs)"]
@@ -128,10 +124,18 @@ graph TD
         end
     end
 
+    subgraph MANAGED["Managed Google Cloud Services"]
+        PG[("Cloud SQL for PostgreSQL<br/>Actor Registry & State")]
+        PG_DR[("Cross-Region Read Replica<br/>(optional, set up separately)")]
+        GCS[("gs://ate-snapshots-...<br/>RAM & Disk Snapshots")]
+    end
+
     %% Ingress Flow
     USER["Client Application"] -->|"HTTP Request<br/>Header: ate-target-actor: tenant/agent-1"| ROUTER
     ROUTER -->|"Lookup Actor Location"| API
-    API <-->|"Query Registry"| PG
+    API -->|"localhost:5432"| PROXY
+    PROXY -->|"TLS + IAM token"| PG
+    PG -.->|"Optional replication"| PG_DR
     ROUTER -->|"Direct Forward (mTLS)"| POD1
     POD1 -->|"Dispatches into Sandbox"| ACTOR1
 
@@ -139,8 +143,8 @@ graph TD
     ACTOR1 -->|"VPC Egress (LLM / TPU / API)"| LLM["LLM Endpoint (Vertex AI / Cloud TPU)"]
 
     %% Suspend & Resume Flow
-    ACTOR1 -.->|"1. Idle Timeout (Suspend RAM/Disk)"| BUCKET
-    BUCKET -.->|"2. Wake-up Request (Resume onto available Worker)"| RESUME_TARGET
+    ACTOR1 -.->|"1. Idle Timeout (Suspend RAM/Disk)"| GCS
+    GCS -.->|"2. Wake-up Request (Resume onto available Worker)"| RESUME_TARGET
 ```
 
 ---
@@ -173,8 +177,8 @@ Substrate supports two operational topologies for this database:
 | :--- | :--- | :--- |
 | **Topology** | Runs inside GKE cluster as a `StatefulSet` with PVC | Managed GCP Service external to GKE cluster |
 | **Authentication** | Password or mTLS certs projected via K8s secrets | **Zero-Trust IAM Database Authentication** (no passwords) |
-| **High Availability** | Pod restarts / Kubernetes node rescheduling | **Regional HA** with automatic synchronous zone failover (99.95% SLA) |
-| **Multi-Region Disaster Recovery** | ❌ **Extremely Difficult**: State trapped on local cluster PVC |  **Native**: Asynchronous **Cross-Region Read Replicas** |
+| **High Availability** | Pod restarts / Kubernetes node rescheduling | Optional **Regional HA** (`AVAILABILITY_TYPE=REGIONAL`) with automatic zonal failover |
+| **Multi-Region Disaster Recovery** | ❌ **Extremely Difficult**: State trapped on local cluster PVC | Possible with **Cross-Region Read Replicas** (set up separately; not automated here) |
 | **Cluster Lifecycle Decoupling** | ❌ Tied to cluster lifecycle: deleting GKE cluster destroys metadata |  Decoupled: Destroying or recreating GKE clusters preserves all agent state |
 | **Connection Security** | In-cluster plaintext or self-managed TLS | **TLS 1.3 tunnel via Cloud SQL Auth Proxy sidecar** |
 | **Recommended Environment** | Local Kind, Dev/Test, ephemeral POCs | **Tier-1 Enterprise Production (e.g. Banking, Global Telecom)** |
@@ -301,37 +305,68 @@ postgres-0                                     2/2     Running   0          2m
 
 ### Phase 5: Externalizing State to Cloud SQL for PostgreSQL (Production)
 
-For production deployments, externalize the state store to Cloud SQL for PostgreSQL using the automated setup script:
+The default install keeps `ate-api-server`'s state in the in-cluster `postgres-0` StatefulSet. For production, move it to Cloud SQL for PostgreSQL. `ate-api-server` reaches Cloud SQL through the Cloud SQL Auth Proxy sidecar, and the proxy authenticates as a Google service account (GSA) through Workload Identity using IAM database authentication. No database password is stored in the cluster.
+
+**Before you start:** suspend every actor (`kubectl ate get actors -a <atespace>`, then `kubectl ate suspend actor ...`). The copy needs a quiesced control plane with no actor assigned to a worker; the script checks this and stops if any actor is still running. Expect a few minutes of control-plane downtime while the data is copied.
 
 ```bash
-# 1. Run the automated Cloud SQL provisioning & Workload Identity script
-./scripts/setup-cloudsql.sh
+PROJECT_ID=your-gcp-project REGION=us-central1 ./scripts/setup-cloudsql.sh
 ```
 
-This automated script performs the following production configuration:
-1. Enables `sqladmin.googleapis.com`.
-2. Provisions a Regional HA PostgreSQL 15 instance (`substrate-pg-dev`) with IAM database authentication enabled (`cloudsql.iam_authentication=on`).
-3. Creates a dedicated Google Service Account (`ate-api-sql-sa`), grants `roles/cloudsql.client` and `roles/cloudsql.instanceUser`, and binds GKE Workload Identity to `ate-system/ate-api-server`.
-4. Populates `ate-api-server-envvars` ConfigMap with the instance connection name and proxy settings.
-5. Injects the native `cloud-sql-proxy` sidecar container into `ate-api-server` deployment via strategic-merge patch (`manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml`).
-6. Verifies rollout and connection health.
+Optional settings: `INSTANCE_NAME`, `DB_NAME` (default `atepg`), `DB_VERSION` (default `POSTGRES_15`), `AVAILABILITY_TYPE` (`ZONAL` by default; use `REGIONAL` for HA), `GSA_NAME`, `BUCKET_NAME`, and `MIGRATE_DATA=false` to start with an empty database instead of copying.
 
-Once verified, you can decommission the in-cluster `StatefulSet`:
-```bash
-kubectl delete statefulset postgres -n ate-system
-kubectl delete pvc -l app=postgres -n ate-system
-```
+What [`scripts/setup-cloudsql.sh`](scripts/setup-cloudsql.sh) does. It is idempotent and safe to re-run:
 
-Verify both replicas of `ate-api-server` are running with `2/2` containers (the `ateapi` app + `cloud-sql-proxy` sidecar):
+1. **Backs up** the current `ate-api-server` Secret, ConfigMap and Deployment to a local `cloudsql-backup-<timestamp>/` directory.
+2. **Provisions** the Cloud SQL instance with `cloudsql.iam_authentication=on`, plus the database, if they don't exist.
+3. **Sets up identity:**
+   - creates the GSA and grants it `roles/cloudsql.client` and `roles/cloudsql.instanceUser`
+   - binds Workload Identity to `ate-system/ate-api-server` and annotates that ServiceAccount
+   - grants the GSA `storage.objectAdmin` and `storage.bucketViewer` on the snapshot bucket
+4. **Creates the IAM database user** and runs the one-time `GRANT CREATE` on the database and `public` schema. It uses a temporary `postgres` password that is scrambled when the script exits.
+5. **Copies the data**, if the target database is empty and `postgres-0` is in use:
+   - scales `ate-api-server` to 0 and dumps `postgres-0`
+   - restores the dump in a single transaction as the IAM user, so that user owns every table
+   - checks that every table's row count matches
+   - on any mismatch or error, scales `ate-api-server` back up on the in-cluster database and stops
+   - never overwrites a database that already has tables
+6. **Switches `ate-api-server` to Cloud SQL:**
+   - writes the connection string to the Secret `ate-api-server-secret-envvars`
+   - writes the proxy settings to the ConfigMap `ate-api-server-envvars`
+   - injects the sidecar from [`proxy-sidecar-patch.yaml`](manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml) and rolls out the pods
+7. **Verifies the switch**, and fails if any check doesn't pass:
+   - each pod's proxy has accepted connections
+   - `ate-api-server` reports `PostgreSQL migrations ready`
+   - Cloud SQL shows sessions from the IAM user
+   - `postgres-0` has **no** connections from `ate-api-server`
+
+> [!IMPORTANT]
+> **Three things that break this migration if done by hand:**
+> 1. **The connection string lives in the Secret, not the ConfigMap.** `ate-api-server` reads the ConfigMap first and the Secret second, so the Secret wins. Changing only the ConfigMap leaves `ate-api-server` on `postgres-0` while the proxy sidecar sits idle.
+> 2. **Cloud SQL IAM users start with no privileges.** PostgreSQL 15 and later removed `CREATE` on the `public` schema for regular users. Without the one-time `GRANT`, `ate-api-server` fails with `permission denied for schema public`.
+> 3. **Annotating the ServiceAccount with a GSA changes `ate-api-server`'s Cloud Storage identity too.** If the GSA lacks the snapshot-bucket roles, suspends fail with `PermissionDenied ... storage.objects.list`.
+
+Check the result yourself:
+
 ```bash
+# Both replicas run the ateapi container plus the cloud-sql-proxy sidecar (2/2)
 kubectl get pods -n ate-system -l app=ate-api-server
+
+# The proxy is carrying ateapi's database traffic
+kubectl logs -n ate-system deploy/ate-api-server -c cloud-sql-proxy | grep "Accepted connection"
+
+# The in-cluster database no longer has connections from ate-api-server
+kubectl exec -n ate-system postgres-0 -c postgres -- \
+  psql -U postgres -d atepg -c "select client_addr, count(*) from pg_stat_activity where datname='atepg' group by 1;"
+
+# A suspend and resume round trip works end to end
+kubectl ate suspend actor <name> -a <atespace> && kubectl ate resume actor <name> -a <atespace>
 ```
-Expected output:
-```
-NAME                             READY   STATUS    RESTARTS   AGE
-ate-api-server-66d5cbbd7-55psz   2/2     Running   0          2m
-ate-api-server-66d5cbbd7-mqsld   2/2     Running   0          2m
-```
+
+**Rollback:** `postgres-0` is left untouched. To return to it, run `kubectl apply -f cloudsql-backup-<timestamp>/secret.yaml && kubectl -n ate-system rollout restart deployment/ate-api-server`. Changes made after the switch exist only in Cloud SQL. When you are confident, stop the in-cluster database with `kubectl -n ate-system scale statefulset postgres --replicas=0`, and keep its PVC until you are sure you no longer need it.
+
+> [!NOTE]
+> The script covers a single Cloud SQL instance. HA failover drills and cross-region read replicas for disaster recovery are separate steps that this repository does not automate.
 
 ### Phase 6: Deploy WorkerPool & ComputeClass
 
